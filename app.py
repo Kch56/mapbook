@@ -2085,11 +2085,7 @@ def _build_mapbook_pdf(station_id: int, options: dict, output_target) -> None:
 
     marker_scale = export_scale
     map_frame_w = 1530
-    map_frame_h = 1880
-    render_mode = bool(os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("RENDER"))
-    if render_mode:
-        map_frame_w = 1224
-        map_frame_h = 1504
+    map_frame_h = 1920
 
     for feature in pages:
         props = feature.get("properties") or {}
