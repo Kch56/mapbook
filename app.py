@@ -1867,11 +1867,17 @@ def fit_bbox_to_aspect(west, south, east, north, target_w_px, target_h_px):
 # MAPBOOK DOWNLOAD (portrait pages, cover + index)
 # -----------------------------
 def _get_mapbook_options(args) -> dict:
+    default_export_scale = os.environ.get("MAPBOOK_EXPORT_SCALE")
+    if default_export_scale is None:
+        default_export_scale = "1.35" if os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("RENDER") else "2.0"
+
+    default_export_zoom_delta = os.environ.get("MAPBOOK_EXPORT_ZOOM_DELTA", "1")
     return {
         "cell_size_m": float(args.get("cell_size_m", "500")),
         "overlap_threshold": float(args.get("overlap_threshold", "0.10")),
         "zoom": int(args.get("zoom", "15")),
-        "export_scale": float(args.get("export_scale", "2.4")),
+        "export_scale": float(args.get("export_scale", default_export_scale)),
+        "export_zoom_delta": int(args.get("export_zoom_delta", default_export_zoom_delta)),
         "include_address": args.get("include_address", "0") == "1",
         "include_hydrants": args.get("include_hydrants", "0") == "1",
         "include_speed": args.get("include_speed", "0") == "1",
@@ -1897,7 +1903,7 @@ def _all_station_ids() -> list[int]:
     return sorted(station_ids)
 
 
-def build_mapbook_pdf_buffer(station_id: int, options: dict) -> io.BytesIO:
+def _build_mapbook_pdf(station_id: int, options: dict, output_target) -> None:
     cell_size_m = options["cell_size_m"]
     overlap_threshold = options["overlap_threshold"]
     zoom = options["zoom"]
@@ -1910,7 +1916,8 @@ def build_mapbook_pdf_buffer(station_id: int, options: dict) -> io.BytesIO:
     label_streets = options["label_streets"]
     label_address = options["label_address"]
 
-    export_zoom = zoom + 2  # PDF export zoom only
+    export_zoom_delta = max(0, min(2, int(options.get("export_zoom_delta", 1))))
+    export_zoom = min(16, zoom + export_zoom_delta)  # PDF export zoom only
 
     station_geo = get_station_feature_geojson(station_id)
     if isinstance(station_geo, dict) and station_geo.get("_arcgis_error"):
@@ -1944,8 +1951,7 @@ def build_mapbook_pdf_buffer(station_id: int, options: dict) -> io.BytesIO:
             return ""
         return f"{row_to_letter.get(r, '?')}{col_to_num.get(c, '?')}"
 
-    pdf_buf = io.BytesIO()
-    c = canvas.Canvas(pdf_buf, pagesize=letter)
+    c = canvas.Canvas(output_target, pagesize=letter)
     pdf_w, pdf_h = letter
 
     def add_pil_page(pil_img: Image.Image):
@@ -1962,6 +1968,8 @@ def build_mapbook_pdf_buffer(station_id: int, options: dict) -> io.BytesIO:
             anchor="c",
         )
         c.showPage()
+        pil_img.close()
+        img_bytes.close()
 
     add_pil_page(make_cover_page_image(station_id=station_id))
     add_pil_page(make_overview_page_image(
@@ -2028,6 +2036,7 @@ def build_mapbook_pdf_buffer(station_id: int, options: dict) -> io.BytesIO:
         )
 
         map_img = map_big.resize((map_frame_w, map_frame_h), Image.Resampling.LANCZOS)
+        map_big.close()
         map_img = draw_legend_on_map(
             map_img,
             include_address=include_address,
@@ -2045,6 +2054,7 @@ def build_mapbook_pdf_buffer(station_id: int, options: dict) -> io.BytesIO:
             "W": _cell_label(row, col - 1),
         }
         add_pil_page(make_map_page_image(map_img, page_label, page_num, total_pages, neighbor_labels=neighbor_labels))
+        map_img.close()
         time.sleep(0.03)
 
     rows_per_index_page = 48
@@ -2065,22 +2075,48 @@ def build_mapbook_pdf_buffer(station_id: int, options: dict) -> io.BytesIO:
         ))
 
     c.save()
+
+
+def build_mapbook_pdf_buffer(station_id: int, options: dict) -> io.BytesIO:
+    pdf_buf = io.BytesIO()
+    _build_mapbook_pdf(station_id, options, pdf_buf)
     pdf_buf.seek(0)
     return pdf_buf
+
+
+def build_mapbook_pdf_file(station_id: int, options: dict) -> tuple[str, str]:
+    temp_dir = tempfile.mkdtemp(prefix="cfd_mapbook_")
+    pdf_name = f"station_{station_id}_mapbook.pdf"
+    pdf_path = os.path.join(temp_dir, pdf_name)
+    _build_mapbook_pdf(station_id, options, pdf_path)
+    return pdf_path, temp_dir
 
 
 @app.route("/download/mapbook/<int:station_id>")
 def download_mapbook(station_id: int):
     options = _get_mapbook_options(request.args)
     try:
-        pdf_buf = build_mapbook_pdf_buffer(station_id, options)
+        pdf_path, temp_dir = build_mapbook_pdf_file(station_id, options)
     except RuntimeError as exc:
         return jsonify({"error": str(exc)}), 500
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 404
+    except Exception as exc:
+        return jsonify({"error": f"Mapbook generation failed: {exc}"}), 500
+
+    @after_this_request
+    def _cleanup_mapbook_file(response):
+        try:
+            if os.path.exists(pdf_path):
+                os.remove(pdf_path)
+            if os.path.isdir(temp_dir):
+                os.rmdir(temp_dir)
+        except Exception:
+            pass
+        return response
 
     return send_file(
-        pdf_buf,
+        pdf_path,
         mimetype="application/pdf",
         as_attachment=True,
         download_name=f"station_{station_id}_mapbook.pdf",
