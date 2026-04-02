@@ -11,6 +11,7 @@ import zipfile
 import requests
 import sys
 import threading
+import traceback
 from pathlib import Path
 from uuid import uuid4
 
@@ -1875,7 +1876,7 @@ def fit_bbox_to_aspect(west, south, east, north, target_w_px, target_h_px):
 def _get_mapbook_options(args) -> dict:
     default_export_scale = os.environ.get("MAPBOOK_EXPORT_SCALE")
     if default_export_scale is None:
-        default_export_scale = "1.0" if os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("RENDER") else "2.0"
+        default_export_scale = "0.8" if os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("RENDER") else "2.0"
 
     default_export_zoom_delta = os.environ.get(
         "MAPBOOK_EXPORT_ZOOM_DELTA",
@@ -1964,8 +1965,16 @@ def _run_mapbook_job(job_id: str, station_id: int, options: dict) -> None:
             temp_dir=temp_dir,
             download_name=f"station_{station_id}_mapbook.pdf",
         )
+    except MemoryError:
+        _set_download_job(
+            job_id,
+            status="error",
+            error="Mapbook generation ran out of memory on the server. Try again with fewer overlays or a lighter export setting.",
+        )
     except Exception as exc:
-        _set_download_job(job_id, status="error", error=str(exc))
+        detail = str(exc).strip() or exc.__class__.__name__
+        _set_download_job(job_id, status="error", error=detail)
+        traceback.print_exc()
 
 
 def _create_mapbook_job(station_id: int, options: dict) -> str:
@@ -2047,7 +2056,8 @@ def _build_mapbook_pdf(station_id: int, options: dict, output_target) -> None:
 
     def add_pil_page(pil_img: Image.Image):
         img_bytes = io.BytesIO()
-        pil_img.save(img_bytes, format="PNG")
+        page_rgb = pil_img.convert("RGB")
+        page_rgb.save(img_bytes, format="JPEG", quality=82, optimize=True)
         img_bytes.seek(0)
         margin = 18
         c.drawImage(
@@ -2059,6 +2069,7 @@ def _build_mapbook_pdf(station_id: int, options: dict, output_target) -> None:
             anchor="c",
         )
         c.showPage()
+        page_rgb.close()
         pil_img.close()
         img_bytes.close()
 
@@ -2075,6 +2086,10 @@ def _build_mapbook_pdf(station_id: int, options: dict, output_target) -> None:
     marker_scale = export_scale
     map_frame_w = 1530
     map_frame_h = 1880
+    render_mode = bool(os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("RENDER"))
+    if render_mode:
+        map_frame_w = 1224
+        map_frame_h = 1504
 
     for feature in pages:
         props = feature.get("properties") or {}
@@ -2089,8 +2104,8 @@ def _build_mapbook_pdf(station_id: int, options: dict, output_target) -> None:
         )
 
         page_label = f"{row_to_letter.get(row, '?')}{col_to_num.get(col, '?')}"
-        big_w = int(map_frame_w * export_scale)
-        big_h = int(map_frame_h * export_scale)
+        big_w = max(900, int(map_frame_w * export_scale))
+        big_h = max(1100, int(map_frame_h * export_scale))
 
         map_big = stitch_bbox_map(
             west, south, east, north,
@@ -2114,16 +2129,6 @@ def _build_mapbook_pdf(station_id: int, options: dict, output_target) -> None:
             include_firestations=include_firestations,
             label_streets=label_streets,
             hydrant_scale=marker_scale * 1.35,
-        )
-        map_big = draw_legend_on_map(
-            map_big,
-            include_address=include_address,
-            include_hydrants=include_hydrants,
-            include_speed=include_speed,
-            include_centerlines=include_centerlines,
-            include_firestations=include_firestations,
-            marker_scale=max(0.9, marker_scale * 0.6),
-            position="top_left",
         )
 
         map_img = map_big.resize((map_frame_w, map_frame_h), Image.Resampling.LANCZOS)
