@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>CFD Map Books MVP</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <style>
+    body { margin:0; font-family: Arial, sans-serif; }
+    #map { height: 92vh; }
+
+    .bar{
+      height: 8vh;
+      display:flex;
+      align-items:center;
+      justify-content: space-between;
+      gap:12px;
+      padding: 0 14px;
+      background:#111;
+      color:#fff;
+    }
+    .leftbar{ display:flex; align-items:center; gap:12px; }
+    .pill{ padding:6px 10px; background:#222; border-radius:999px; font-size:14px; }
+
+    .toggles{ display:flex; align-items:center; gap:10px; flex-wrap: wrap; justify-content: flex-end; }
+    .toggle{
+      display:flex; align-items:center; gap:8px;
+      background:#1b1b1b; padding:6px 10px; border-radius:999px;
+      font-size:13px;
+    }
+    .toggle input{ transform: scale(1.1); cursor:pointer; }
+
+    .btn{
+      padding:8px 12px;
+      border:none;
+      cursor:pointer;
+      border-radius:10px;
+      font-weight:700;
+      font-size:13px;
+    }
+    .btn-primary{ background:#ffffff; color:#111; }
+    .btn-primary:disabled{
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+
+    #toast{
+      position: fixed;
+      bottom: 16px;
+      left: 16px;
+      background: rgba(0,0,0,0.85);
+      color: #fff;
+      padding: 10px 12px;
+      border-radius: 10px;
+      display:none;
+      z-index: 9999;
+      font-size: 13px;
+      max-width: 420px;
+    }
+
+    .tri { width: 18px; height: 18px; transform: translate(-9px, -9px); pointer-events: auto; }
+  </style>
+</head>
+<body>
+  <div class="bar">
+    <div class="leftbar">
+      <b>CFD Map Books MVP</b>
+      <span class="pill" id="status">Loading station areas…</span>
+    </div>
+
+    <div class="toggles">
+      <button class="btn btn-primary" id="downloadBtn" disabled>
+        Download Mapbook (PDF)
+      </button>
+      <button class="btn btn-primary" id="downloadAllBtn" disabled>
+        Download All Mapbooks (ZIP)
+      </button>
+
+      <label class="toggle">
+        <input type="checkbox" id="toggleAddress">
+        Address Points (file)
+      </label>
+      <label class="toggle">
+        <input type="checkbox" id="toggleHydrants">
+        Hydrants (FLOW)
+      </label>
+      <label class="toggle">
+        <input type="checkbox" id="toggleSpeed">
+        Speed Humps
+      </label>
+    </div>
+  </div>
+
+  <div id="map"></div>
+  <div id="toast"></div>
+
+  <script>
+    const map = L.map('map').setView([35.2271, -80.8431], 11);
+
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19,
+      attribution: '&copy; OpenStreetMap'
+    }).addTo(map);
+
+    let areasLayer = null;
+    let gridLayer = null;
+    let selectedStationLayer = null;
+
+    let addressLayer = L.layerGroup();
+    let hydrantsLayer = L.layerGroup();
+    let speedLayer = L.layerGroup();
+
+    const DEFAULT_CELL_SIZE_M = 800;
+    const DEFAULT_OVERLAP = 0.10;
+
+    let selectedStationId = null;
+    const downloadBtn = document.getElementById("downloadBtn");
+    const downloadAllBtn = document.getElementById("downloadAllBtn");
+    let availableStationCount = 0;
+
+    function setStatus(msg){ document.getElementById("status").innerText = msg || ""; }
+
+    function toast(msg){
+      const el = document.getElementById("toast");
+      el.innerText = msg;
+      el.style.display = "block";
+      setTimeout(() => el.style.display = "none", 5200);
+    }
+
+    function clearGrid(){
+      if (gridLayer) map.removeLayer(gridLayer);
+      gridLayer = null;
+    }
+
+    function resetSelectedStyle(){
+      if (selectedStationLayer){
+        selectedStationLayer.setStyle({ color:"#2b6cff", weight: 2, fillOpacity: 0.12 });
+        selectedStationLayer = null;
+      }
+    }
+
+    function getToggleState(){
+      return {
+        address: document.getElementById("toggleAddress").checked,
+        hydrants: document.getElementById("toggleHydrants").checked,
+        speed: document.getElementById("toggleSpeed").checked
+      };
+    }
+
+    function setDownloadEnabled(enabled){
+      downloadBtn.disabled = !enabled;
+    }
+
+    function setDownloadAllEnabled(enabled){
+      downloadAllBtn.disabled = !enabled;
+    }
+
+    function buildDownloadQuery(){
+      const t = getToggleState();
+      return (
+        `?cell_size_m=${DEFAULT_CELL_SIZE_M}` +
+        `&overlap_threshold=${DEFAULT_OVERLAP}` +
+        `&zoom=15` +
+        `&include_address=${t.address ? 1 : 0}` +
+        `&include_hydrants=${t.hydrants ? 1 : 0}` +
+        `&include_speed=${t.speed ? 1 : 0}`
+      );
+    }
+
+    downloadBtn.addEventListener("click", () => {
+      if (!selectedStationId) return;
+
+      const url = `/download/mapbook/${selectedStationId}` + buildDownloadQuery();
+
+      toast("Generating PDF… (downloads when ready)");
+      window.location.href = url;
+    });
+
+    downloadAllBtn.addEventListener("click", () => {
+      if (!availableStationCount) return;
+
+      const url = `/download/mapbooks/all` + buildDownloadQuery();
+      toast(`Generating ZIP for ${availableStationCount} stationsâ€¦ this can take a while.`);
+      window.location.href = url;
+    });
+
+    function loadGridForStation(stationId){
+      clearGrid();
+      setStatus(`Selecting city fishnet pages for Station ${stationId}...`);
+
+      fetch(`/api/grid_for_station/${stationId}?cell_size_m=${DEFAULT_CELL_SIZE_M}&overlap_threshold=${DEFAULT_OVERLAP}`)
+        .then(r => r.json())
+        .then(gridGeo => {
+          if (gridGeo?.meta?.error) {
+            console.log("grid_for_station error:", gridGeo.meta.error);
+            setStatus("ArcGIS error while building grid (refresh and try again).");
+            toast("ArcGIS connection issue (grid). Try refresh.");
+            return;
+          }
+
+          const pageCount = gridGeo.properties?.page_count ?? gridGeo.features.length;
+          setStatus(`Station ${stationId}: ${pageCount} pages (filtered fishnet cells).`);
+
+          gridLayer = L.geoJSON(gridGeo, {
+            style: () => ({ color:"#ff2b2b", weight: 3, fillOpacity: 0.0 }),
+            onEachFeature: (feature, layer) => {
+              const p = feature.properties || {};
+              layer.on("click", () => {
+                layer.bindPopup(`<b>Map Book Page:</b> ${p.page}<br/>Fishnet: r${p.row} c${p.col}`).openPopup();
+              });
+            }
+          }).addTo(map);
+
+          map.fitBounds(gridLayer.getBounds());
+        })
+        .catch(err => {
+          console.error(err);
+          setStatus("Failed to load fishnet pages.");
+        });
+    }
+
+    let refreshTimer = null;
+
+    function getBBoxParams(){
+      const b = map.getBounds();
+      return { west: b.getWest(), south: b.getSouth(), east: b.getEast(), north: b.getNorth() };
+    }
+
+    function debounceRefresh(){
+      if (refreshTimer) clearTimeout(refreshTimer);
+      refreshTimer = setTimeout(refreshActiveLayers, 250);
+    }
+
+    function hydrantColor(flow){
+      const f = parseFloat(flow);
+      if (isNaN(f)) return "#dddddd";
+      if (f <= 500) return "#dc0000";
+      if (f <= 999) return "#ff8c00";
+      if (f <= 1499) return "#00a000";
+      return "#005aff";
+    }
+
+    function refreshActiveLayers(){
+      const bbox = getBBoxParams();
+      const t = getToggleState();
+
+      if (t.address){
+        fetch(`/api/layer/addresspoints?west=${bbox.west}&south=${bbox.south}&east=${bbox.east}&north=${bbox.north}&max=2500`)
+          .then(r => r.json())
+          .then(gj => {
+            addressLayer.clearLayers();
+            (gj.features || []).forEach(f => {
+              if (!f.geometry || f.geometry.type !== "Point") return;
+              const [lon, lat] = f.geometry.coordinates;
+
+              L.circleMarker([lat, lon], {
+                radius: 3,
+                weight: 1,
+                color: "#000",
+                fillColor: "#000",
+                fillOpacity: 0.95
+              }).addTo(addressLayer);
+            });
+
+            if (!map.hasLayer(addressLayer)) addressLayer.addTo(map);
+          })
+          .catch(console.error);
+      }
+
+      if (t.hydrants){
+        fetch(`/api/layer/hydrants?west=${bbox.west}&south=${bbox.south}&east=${bbox.east}&north=${bbox.north}&max=2000`)
+          .then(r => r.json())
+          .then(gj => {
+            if (gj?.meta?.error) return;
+            hydrantsLayer.clearLayers();
+            (gj.features || []).forEach(f => {
+              if (!f.geometry || f.geometry.type !== "Point") return;
+              const [lon, lat] = f.geometry.coordinates;
+              const flow = (f.properties || {}).FLOW;
+
+              L.circleMarker([lat, lon], {
+                radius: 6,
+                weight: 1,
+                color: "#000",
+                fillOpacity: 0.85,
+                fillColor: hydrantColor(flow)
+              }).addTo(hydrantsLayer);
+            });
+
+            if (!map.hasLayer(hydrantsLayer)) hydrantsLayer.addTo(map);
+          })
+          .catch(console.error);
+      }
+
+      if (t.speed){
+        fetch(`/api/layer/speedhumps?west=${bbox.west}&south=${bbox.south}&east=${bbox.east}&north=${bbox.north}&max=2000`)
+          .then(r => r.json())
+          .then(gj => {
+            if (gj?.meta?.error) return;
+            speedLayer.clearLayers();
+            (gj.features || []).forEach(f => {
+              if (!f.geometry || f.geometry.type !== "Point") return;
+              const [lon, lat] = f.geometry.coordinates;
+
+              const triSvg = `
+                <svg class="tri" viewBox="0 0 24 24">
+                  <polygon points="12,2 2,22 22,22" fill="#9100ff" stroke="#000" stroke-width="1"/>
+                </svg>
+              `;
+              const icon = L.divIcon({ html: triSvg, className: "", iconSize: [18,18], iconAnchor: [9,9] });
+              L.marker([lat, lon], { icon }).addTo(speedLayer);
+            });
+
+            if (!map.hasLayer(speedLayer)) speedLayer.addTo(map);
+          })
+          .catch(console.error);
+      }
+    }
+
+    document.getElementById("toggleAddress").addEventListener("change", () => {
+      if (document.getElementById("toggleAddress").checked){
+        refreshActiveLayers();
+      } else if (map.hasLayer(addressLayer)) {
+        map.removeLayer(addressLayer);
+      }
+    });
+
+    document.getElementById("toggleHydrants").addEventListener("change", () => {
+      if (document.getElementById("toggleHydrants").checked){
+        refreshActiveLayers();
+      } else if (map.hasLayer(hydrantsLayer)) {
+        map.removeLayer(hydrantsLayer);
+      }
+    });
+
+    document.getElementById("toggleSpeed").addEventListener("change", () => {
+      if (document.getElementById("toggleSpeed").checked){
+        refreshActiveLayers();
+      } else if (map.hasLayer(speedLayer)) {
+        map.removeLayer(speedLayer);
+      }
+    });
+
+    map.on("moveend", debounceRefresh);
+    map.on("zoomend", debounceRefresh);
+
+    fetch("/api/areas")
+      .then(r => r.json())
+      .then(geo => {
+        if (geo?.meta?.error) {
+          setStatus("Station areas failed (ArcGIS). Refresh and try again.");
+          toast("ArcGIS connection issue loading station areas. Refresh.");
+          return;
+        }
+
+        areasLayer = L.geoJSON(geo, {
+          style: () => ({ color:"#2b6cff", weight: 2, fillOpacity: 0.12 }),
+          onEachFeature: (feature, layer) => {
+            const p = feature.properties || {};
+            const station = p.Station;
+
+            layer.on("click", () => {
+              selectedStationId = station;
+              setDownloadEnabled(true);
+
+              resetSelectedStyle();
+              selectedStationLayer = layer;
+              layer.setStyle({ color:"#2b6cff", weight: 4, fillOpacity: 0.18 });
+              layer.bringToFront();
+
+              loadGridForStation(station);
+
+              layer.bindPopup(
+                `<b>Station ${station}</b><br/>Battalion: ${p.Battalion ?? "—"}`
+              ).openPopup();
+            });
+          }
+        }).addTo(map);
+
+        availableStationCount = geo.features.length;
+        setDownloadAllEnabled(availableStationCount > 0);
+        map.fitBounds(areasLayer.getBounds());
+        setStatus(`Loaded ${geo.features.length} station areas. Click a polygon.`);
+      })
+      .catch(err => {
+        console.error(err);
+        setStatus("Failed to load station areas.");
+      });
+  </script>
+</body>
+</html>
