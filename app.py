@@ -58,9 +58,10 @@ USER_AGENT = "CFD-MapBooks-MVP/OSM-Export (internal use)"
 ADDRESS_GPKG_PATH = os.path.join("data", "AddressPoints.gpkg")
 ADDRESS_LAYER_NAME = None  # set exact layer name if needed; None uses first layer
 
-_address_gdf = None
-_address_sindex = None
 _address_field_map = None
+_address_source_crs = None
+_address_bbox_transformer = None
+_address_columns = None
 
 STREET_SUFFIX_NORMALIZATION = {
     "STREET": "ST",
@@ -91,32 +92,27 @@ STREET_SUFFIX_NORMALIZATION = {
 
 
 def load_address_points():
-    """Load address points once and build spatial index."""
-    global _address_gdf, _address_sindex, _address_field_map
-    if _address_gdf is not None and _address_sindex is not None:
+    """Load lightweight metadata for the address GeoPackage."""
+    global _address_field_map, _address_source_crs, _address_bbox_transformer, _address_columns
+    if _address_field_map is not None and _address_source_crs is not None and _address_columns is not None:
         return
 
     if not os.path.exists(ADDRESS_GPKG_PATH):
         raise FileNotFoundError(f"Missing {ADDRESS_GPKG_PATH}. Put exported GPKG in data/.")
 
-    gdf = gpd.read_file(ADDRESS_GPKG_PATH, layer=ADDRESS_LAYER_NAME)
+    gdf = gpd.read_file(ADDRESS_GPKG_PATH, layer=ADDRESS_LAYER_NAME, rows=1)
 
     # If CRS missing, assume EPSG:4326 (adjust if your export CRS differs)
     if gdf.crs is None:
         gdf = gdf.set_crs("EPSG:4326")
 
-    # Normalize to WGS84 lon/lat
-    # AddressPoints sample is often EPSG:4269 (NAD83), which is close but not identical.
-    # Reproject to EPSG:4326 so everything is consistent.
+    _address_source_crs = gdf.crs
+    _address_bbox_transformer = None
+    _address_columns = list(gdf.columns)
     if str(gdf.crs).upper() != "EPSG:4326":
-        gdf = gdf.to_crs("EPSG:4326")
+        _address_bbox_transformer = Transformer.from_crs("EPSG:4326", gdf.crs, always_xy=True)
 
-    gdf = gdf[gdf.geometry.notnull()].copy()
-    gdf = gdf[gdf.geometry.geom_type == "Point"].copy()
-
-    _address_gdf = gdf
-    _address_sindex = gdf.sindex
-    _address_field_map = None
+    _address_field_map = _build_address_field_map(gdf)
 
 
 def _first_existing_col(gdf: gpd.GeoDataFrame, candidates):
@@ -170,23 +166,77 @@ def _build_address_field_map(gdf: gpd.GeoDataFrame) -> dict:
 
 
 def _get_address_field_map() -> dict:
-    global _address_field_map
     load_address_points()
-    if _address_field_map is None:
-        _address_field_map = _build_address_field_map(_address_gdf)
     return _address_field_map
 
 
-def _get_address_subset_in_bbox(west, south, east, north, max_records=2500):
+def _get_address_column_by_name(*candidates):
     load_address_points()
-    bbox_geom = box(west, south, east, north)
-    idx = list(_address_sindex.query(bbox_geom, predicate="intersects"))
-    if not idx:
-        return _address_gdf.iloc[0:0].copy()
+    cols = set(_address_columns or [])
+    for candidate in candidates:
+        if candidate in cols:
+            return candidate
 
-    subset = _address_gdf.iloc[idx].copy()
+    lowered = {c.lower(): c for c in (_address_columns or [])}
+    for candidate in candidates:
+        if candidate.lower() in lowered:
+            return lowered[candidate.lower()]
+    return None
+
+
+def _address_bbox_in_source_crs(west, south, east, north):
+    load_address_points()
+    if _address_bbox_transformer is None:
+        return (west, south, east, north)
+
+    corners = [
+        _address_bbox_transformer.transform(west, south),
+        _address_bbox_transformer.transform(east, south),
+        _address_bbox_transformer.transform(east, north),
+        _address_bbox_transformer.transform(west, north),
+    ]
+    xs = [pt[0] for pt in corners]
+    ys = [pt[1] for pt in corners]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _normalize_address_subset(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    if gdf.empty:
+        return gdf
+
+    if gdf.crs is None:
+        gdf = gdf.set_crs(_address_source_crs or "EPSG:4326")
+
+    if str(gdf.crs).upper() != "EPSG:4326":
+        gdf = gdf.to_crs("EPSG:4326")
+
+    gdf = gdf[gdf.geometry.notnull()].copy()
+    gdf = gdf[gdf.geometry.geom_type == "Point"].copy()
+    return gdf
+
+
+def _dedupe_columns(columns):
+    out = []
+    for col in columns or []:
+        if col and col not in out:
+            out.append(col)
+    return out
+
+
+def _get_address_subset_in_bbox(west, south, east, north, max_records=2500, columns=None):
+    load_address_points()
+    read_kwargs = {
+        "layer": ADDRESS_LAYER_NAME,
+        "bbox": _address_bbox_in_source_crs(west, south, east, north),
+    }
+    selected_columns = _dedupe_columns(columns)
+    if selected_columns:
+        read_kwargs["columns"] = selected_columns
+
+    subset = gpd.read_file(ADDRESS_GPKG_PATH, **read_kwargs)
+    subset = _normalize_address_subset(subset)
     if len(subset) > max_records:
-        subset = subset.iloc[:max_records]
+        subset = subset.iloc[:max_records].copy()
     return subset
 
 
@@ -230,7 +280,17 @@ def get_address_records_in_bbox(west, south, east, north, max_records=5000):
     Existing map rendering still uses get_address_points_with_labels_in_bbox().
     """
     field_map = _get_address_field_map()
-    subset = _get_address_subset_in_bbox(west, south, east, north, max_records=max_records)
+    subset = _get_address_subset_in_bbox(
+        west, south, east, north,
+        max_records=max_records,
+        columns=[
+            field_map.get("address"),
+            field_map.get("street"),
+            field_map.get("building"),
+            field_map.get("unit"),
+            field_map.get("location"),
+        ],
+    )
     if subset.empty:
         return []
 
@@ -263,13 +323,17 @@ def get_address_points_with_labels_in_bbox(west, south, east, north, max_records
     Returns list of tuples: (lon, lat, label)
     label tries to be the house number or address string.
     """
-    subset = _get_address_subset_in_bbox(west, south, east, north, max_records=max_records)
+    field_map = _get_address_field_map()
+    subset = _get_address_subset_in_bbox(
+        west, south, east, north,
+        max_records=max_records,
+        columns=[field_map.get("address"), field_map.get("building")],
+    )
     if subset.empty:
         return []
 
     # Best label column for this dataset
     # (your uploaded schema includes "Address", "StreetName", "Building", "Apartment", etc.)
-    field_map = _get_address_field_map()
     addr_col = field_map.get("address")
     bldg_col = field_map.get("building")
 
@@ -1686,16 +1750,28 @@ def layer_addresspoints_local():
     north = float(request.args.get("north"))
     max_records = int(request.args.get("max", "2000"))
 
-    subset = _get_address_subset_in_bbox(west, south, east, north, max_records=max_records)
+    # keep a few useful columns for popups
+    field_map = _get_address_field_map()
+    keep = []
+    for col in [
+        field_map.get("address"),
+        field_map.get("street"),
+        field_map.get("building"),
+        field_map.get("unit"),
+        _get_address_column_by_name("ZipCode", "ZIPCODE"),
+        _get_address_column_by_name("CFDRA"),
+    ]:
+        if col and col not in keep:
+            keep.append(col)
+
+    subset = _get_address_subset_in_bbox(
+        west, south, east, north,
+        max_records=max_records,
+        columns=keep,
+    )
     if subset.empty:
         return jsonify({"type": "FeatureCollection", "features": [], "meta": {"count": 0}})
 
-    # keep a few useful columns for popups
-    keep = []
-    for c in ["Address", "StreetName", "Building", "Apartment", "ZipCode", "CFDRA"]:
-        col = _first_existing_col(subset, [c])
-        if col and col not in keep:
-            keep.append(col)
     subset = subset[keep + ["geometry"]] if keep else subset[["geometry"]]
 
     gj = json.loads(subset.to_json())
