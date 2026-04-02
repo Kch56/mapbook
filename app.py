@@ -10,7 +10,9 @@ import re
 import zipfile
 import requests
 import sys
+import threading
 from pathlib import Path
+from uuid import uuid4
 
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -27,6 +29,10 @@ from reportlab.lib.pagesizes import letter
 from reportlab.lib.utils import ImageReader
 
 app = Flask(__name__)
+
+DOWNLOAD_JOB_TTL_SECONDS = 60 * 60
+_download_jobs = {}
+_download_jobs_lock = threading.Lock()
 
 def resource_path(*parts):
     """
@@ -1869,9 +1875,12 @@ def fit_bbox_to_aspect(west, south, east, north, target_w_px, target_h_px):
 def _get_mapbook_options(args) -> dict:
     default_export_scale = os.environ.get("MAPBOOK_EXPORT_SCALE")
     if default_export_scale is None:
-        default_export_scale = "1.35" if os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("RENDER") else "2.0"
+        default_export_scale = "1.0" if os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("RENDER") else "2.0"
 
-    default_export_zoom_delta = os.environ.get("MAPBOOK_EXPORT_ZOOM_DELTA", "1")
+    default_export_zoom_delta = os.environ.get(
+        "MAPBOOK_EXPORT_ZOOM_DELTA",
+        "0" if os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("RENDER") else "1",
+    )
     return {
         "cell_size_m": float(args.get("cell_size_m", "500")),
         "overlap_threshold": float(args.get("overlap_threshold", "0.10")),
@@ -1901,6 +1910,88 @@ def _all_station_ids() -> list[int]:
         except (TypeError, ValueError):
             continue
     return sorted(station_ids)
+
+
+def _cleanup_download_job_resources(job: dict) -> None:
+    file_path = job.get("file_path")
+    temp_dir = job.get("temp_dir")
+
+    try:
+        if file_path and os.path.exists(file_path):
+            os.remove(file_path)
+    except Exception:
+        pass
+
+    try:
+        if temp_dir and os.path.isdir(temp_dir):
+            os.rmdir(temp_dir)
+    except Exception:
+        pass
+
+
+def _prune_download_jobs() -> None:
+    cutoff = time.time() - DOWNLOAD_JOB_TTL_SECONDS
+    stale_job_ids = []
+
+    with _download_jobs_lock:
+        for job_id, job in _download_jobs.items():
+            if job.get("updated_at", 0) < cutoff:
+                stale_job_ids.append(job_id)
+
+        stale_jobs = [_download_jobs.pop(job_id) for job_id in stale_job_ids]
+
+    for job in stale_jobs:
+        _cleanup_download_job_resources(job)
+
+
+def _set_download_job(job_id: str, **updates) -> None:
+    with _download_jobs_lock:
+        job = _download_jobs.get(job_id)
+        if not job:
+            return
+        job.update(updates)
+        job["updated_at"] = time.time()
+
+
+def _run_mapbook_job(job_id: str, station_id: int, options: dict) -> None:
+    _set_download_job(job_id, status="running")
+    try:
+        pdf_path, temp_dir = build_mapbook_pdf_file(station_id, options)
+        _set_download_job(
+            job_id,
+            status="complete",
+            file_path=pdf_path,
+            temp_dir=temp_dir,
+            download_name=f"station_{station_id}_mapbook.pdf",
+        )
+    except Exception as exc:
+        _set_download_job(job_id, status="error", error=str(exc))
+
+
+def _create_mapbook_job(station_id: int, options: dict) -> str:
+    _prune_download_jobs()
+    job_id = uuid4().hex
+    with _download_jobs_lock:
+        _download_jobs[job_id] = {
+            "job_id": job_id,
+            "kind": "mapbook",
+            "station_id": station_id,
+            "status": "queued",
+            "error": None,
+            "file_path": None,
+            "temp_dir": None,
+            "download_name": None,
+            "created_at": time.time(),
+            "updated_at": time.time(),
+        }
+
+    thread = threading.Thread(
+        target=_run_mapbook_job,
+        args=(job_id, station_id, dict(options)),
+        daemon=True,
+    )
+    thread.start()
+    return job_id
 
 
 def _build_mapbook_pdf(station_id: int, options: dict, output_target) -> None:
@@ -2120,6 +2211,78 @@ def download_mapbook(station_id: int):
         mimetype="application/pdf",
         as_attachment=True,
         download_name=f"station_{station_id}_mapbook.pdf",
+    )
+
+
+@app.route("/api/jobs/mapbook/<int:station_id>", methods=["POST"])
+def start_mapbook_job(station_id: int):
+    options = _get_mapbook_options(request.args)
+    try:
+        station_geo = get_station_feature_geojson(station_id)
+        if isinstance(station_geo, dict) and station_geo.get("_arcgis_error"):
+            return jsonify({"error": f"ArcGIS error while loading station {station_id}: {station_geo}"}), 500
+        if not station_geo.get("features"):
+            return jsonify({"error": f"No station geometry for station {station_id}"}), 404
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+    job_id = _create_mapbook_job(station_id, options)
+    return jsonify({
+        "job_id": job_id,
+        "status": "queued",
+        "status_url": f"/api/jobs/{job_id}",
+        "download_url": f"/download/job/{job_id}",
+    }), 202
+
+
+@app.route("/api/jobs/<job_id>")
+def get_download_job(job_id: str):
+    _prune_download_jobs()
+    with _download_jobs_lock:
+        job = _download_jobs.get(job_id)
+        if not job:
+            return jsonify({"error": "Job not found or expired."}), 404
+
+        payload = {
+            "job_id": job_id,
+            "status": job.get("status"),
+            "error": job.get("error"),
+            "download_name": job.get("download_name"),
+        }
+        if job.get("status") == "complete":
+            payload["download_url"] = f"/download/job/{job_id}"
+        return jsonify(payload)
+
+
+@app.route("/download/job/<job_id>")
+def download_generated_job(job_id: str):
+    _prune_download_jobs()
+    with _download_jobs_lock:
+        job = _download_jobs.get(job_id)
+        if not job:
+            return jsonify({"error": "Job not found or expired."}), 404
+        if job.get("status") != "complete" or not job.get("file_path"):
+            return jsonify({"error": "Job is not ready yet."}), 409
+
+        file_path = job.get("file_path")
+        temp_dir = job.get("temp_dir")
+        download_name = job.get("download_name") or "mapbook.pdf"
+
+    @after_this_request
+    def _cleanup_generated_job(response):
+        with _download_jobs_lock:
+            job = _download_jobs.pop(job_id, None)
+        if job:
+            _cleanup_download_job_resources(job)
+        else:
+            _cleanup_download_job_resources({"file_path": file_path, "temp_dir": temp_dir})
+        return response
+
+    return send_file(
+        file_path,
+        mimetype="application/pdf",
+        as_attachment=True,
+        download_name=download_name,
     )
 
 

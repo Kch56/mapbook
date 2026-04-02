@@ -120,6 +120,8 @@
     const downloadBtn = document.getElementById("downloadBtn");
     const downloadAllBtn = document.getElementById("downloadAllBtn");
     let availableStationCount = 0;
+    let activeMapbookJobId = null;
+    let activeMapbookPoller = null;
 
     function setStatus(msg){ document.getElementById("status").innerText = msg || ""; }
 
@@ -170,6 +172,48 @@
       );
     }
 
+    function clearMapbookPoller(){
+      if (activeMapbookPoller){
+        clearTimeout(activeMapbookPoller);
+        activeMapbookPoller = null;
+      }
+    }
+
+    function pollMapbookJob(jobId){
+      fetch(`/api/jobs/${jobId}`)
+        .then(r => r.json().then(data => ({ ok: r.ok, data })))
+        .then(({ ok, data }) => {
+          if (!ok){
+            throw new Error(data?.error || "Mapbook job failed.");
+          }
+
+          if (data.status === "queued" || data.status === "running"){
+            setStatus(`Generating Station ${selectedStationId} mapbook...`);
+            activeMapbookPoller = setTimeout(() => pollMapbookJob(jobId), 2500);
+            return;
+          }
+
+          if (data.status === "complete" && data.download_url){
+            clearMapbookPoller();
+            activeMapbookJobId = null;
+            setDownloadEnabled(true);
+            setStatus(`Station ${selectedStationId} mapbook is ready.`);
+            window.location.href = data.download_url;
+            return;
+          }
+
+          throw new Error(data?.error || "Mapbook generation failed.");
+        })
+        .catch(err => {
+          console.error(err);
+          clearMapbookPoller();
+          activeMapbookJobId = null;
+          setDownloadEnabled(true);
+          toast(err.message || "Mapbook generation failed.");
+          setStatus("Mapbook generation failed.");
+        });
+    }
+
     downloadBtn.addEventListener("click", () => {
       if (!selectedStationId) return;
 
@@ -178,6 +222,35 @@
       toast("Generating PDF… (downloads when ready)");
       window.location.href = url;
     });
+
+    downloadBtn.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+
+      if (!selectedStationId || activeMapbookJobId) return;
+
+      setDownloadEnabled(false);
+      setStatus(`Queueing Station ${selectedStationId} mapbook...`);
+      toast("Generating PDF... this can take a bit on Render.");
+
+      fetch(`/api/jobs/mapbook/${selectedStationId}` + buildDownloadQuery(), { method: "POST" })
+        .then(r => r.json().then(data => ({ ok: r.ok, data })))
+        .then(({ ok, data }) => {
+          if (!ok){
+            throw new Error(data?.error || "Unable to start mapbook generation.");
+          }
+
+          activeMapbookJobId = data.job_id;
+          pollMapbookJob(data.job_id);
+        })
+        .catch(err => {
+          console.error(err);
+          activeMapbookJobId = null;
+          setDownloadEnabled(true);
+          toast(err.message || "Unable to start mapbook generation.");
+          setStatus("Unable to start mapbook generation.");
+        });
+    }, true);
 
     downloadAllBtn.addEventListener("click", () => {
       if (!availableStationCount) return;
