@@ -2085,7 +2085,7 @@ def _build_mapbook_pdf(station_id: int, options: dict, output_target) -> None:
 
     marker_scale = export_scale
     map_frame_w = 1530
-    map_frame_h = 1920
+    map_frame_h = 1880
 
     for feature in pages:
         props = feature.get("properties") or {}
@@ -2100,8 +2100,8 @@ def _build_mapbook_pdf(station_id: int, options: dict, output_target) -> None:
         )
 
         page_label = f"{row_to_letter.get(row, '?')}{col_to_num.get(col, '?')}"
-        big_w = max(900, int(map_frame_w * export_scale))
-        big_h = max(1100, int(map_frame_h * export_scale))
+        big_w = int(map_frame_w * export_scale)
+        big_h = int(map_frame_h * export_scale)
 
         map_big = stitch_bbox_map(
             west, south, east, north,
@@ -2125,6 +2125,17 @@ def _build_mapbook_pdf(station_id: int, options: dict, output_target) -> None:
             include_firestations=include_firestations,
             label_streets=label_streets,
             hydrant_scale=marker_scale * 1.35,
+        )
+
+        map_big = draw_legend_on_map(
+            map_big,
+            include_address=include_address,
+            include_hydrants=include_hydrants,
+            include_speed=include_speed,
+            include_centerlines=include_centerlines,
+            include_firestations=include_firestations,
+            marker_scale=max(0.9, marker_scale * 0.6),
+            position="top_left",
         )
 
         map_img = map_big.resize((map_frame_w, map_frame_h), Image.Resampling.LANCZOS)
