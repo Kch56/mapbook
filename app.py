@@ -1885,11 +1885,11 @@ def fit_bbox_to_aspect(west, south, east, north, target_w_px, target_h_px):
 def _get_mapbook_options(args) -> dict:
     default_export_scale = os.environ.get("MAPBOOK_EXPORT_SCALE")
     if default_export_scale is None:
-        default_export_scale = "0.8" if os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("RENDER") else "2.0"
+        default_export_scale = "2.4"
 
     default_export_zoom_delta = os.environ.get(
         "MAPBOOK_EXPORT_ZOOM_DELTA",
-        "0" if os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("RENDER") else "1",
+        "2",
     )
     return {
         "cell_size_m": float(args.get("cell_size_m", "500")),
@@ -2025,8 +2025,8 @@ def _build_mapbook_pdf(station_id: int, options: dict, output_target) -> None:
     label_streets = options["label_streets"]
     label_address = options["label_address"]
 
-    export_zoom_delta = max(0, min(2, int(options.get("export_zoom_delta", 1))))
-    export_zoom = min(16, zoom + export_zoom_delta)  # PDF export zoom only
+    export_zoom_delta = max(0, int(options.get("export_zoom_delta", 2)))
+    export_zoom = zoom + export_zoom_delta  # PDF export zoom only
 
     station_geo = get_station_feature_geojson(station_id)
     if isinstance(station_geo, dict) and station_geo.get("_arcgis_error"):
@@ -2065,8 +2065,7 @@ def _build_mapbook_pdf(station_id: int, options: dict, output_target) -> None:
 
     def add_pil_page(pil_img: Image.Image):
         img_bytes = io.BytesIO()
-        page_rgb = pil_img.convert("RGB")
-        page_rgb.save(img_bytes, format="JPEG", quality=82, optimize=True)
+        pil_img.save(img_bytes, format="PNG")
         img_bytes.seek(0)
         margin = 18
         c.drawImage(
@@ -2078,7 +2077,6 @@ def _build_mapbook_pdf(station_id: int, options: dict, output_target) -> None:
             anchor="c",
         )
         c.showPage()
-        page_rgb.close()
         pil_img.close()
         img_bytes.close()
 
