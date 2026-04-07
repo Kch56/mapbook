@@ -1386,6 +1386,15 @@ def make_overview_page_image(station_geom_wgs84, pages, row_to_letter, col_to_nu
     return img
 
 
+def _map_page_frame_size():
+    page_w, page_h = 1650, 2200
+    margin = 60
+    footer_h = 160
+    map_w = (page_w - margin) - margin
+    map_h = (page_h - margin - footer_h) - margin
+    return map_w, map_h
+
+
 def make_map_page_image(
     map_img: Image.Image,
     page_label: str,
@@ -2084,8 +2093,7 @@ def _build_mapbook_pdf(station_id: int, options: dict, output_target) -> None:
     ))
 
     marker_scale = export_scale
-    map_frame_w = 1530
-    map_frame_h = 1880
+    map_frame_w, map_frame_h = _map_page_frame_size()
 
     for feature in pages:
         props = feature.get("properties") or {}
